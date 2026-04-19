@@ -1,5 +1,6 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useContext } from 'react'
 import '../layouts/DashboardLayout.css'
+import { AuthContext } from '../context/AuthContext'
 
 interface HistoryItem {
   id: string
@@ -12,10 +13,16 @@ interface HistoryItem {
 export default function HistoryPage() {
   const [history, setHistory] = useState<HistoryItem[]>([])
   const [loading, setLoading] = useState(true)
-
+  const authContext = useContext(AuthContext)
+  
   useEffect(() => {
+    if (!authContext?.user?.uid) {
+      setLoading(false)
+      return
+    }
+    
     // Fetch API to hit FastAPI backend
-    fetch('http://localhost:8000/api/history')
+    fetch(`http://localhost:8000/api/history?user_id=${authContext.user.uid}`)
       .then((res) => {
         if (!res.ok) throw new Error('Failed to fetch history')
         return res.json()
@@ -23,12 +30,12 @@ export default function HistoryPage() {
       .then((data: HistoryItem[]) => setHistory(data))
       .catch((err) => console.error('Error fetching history:', err))
       .finally(() => setLoading(false))
-  }, [])
+  }, [authContext?.user?.uid])
 
   return (
     <div className="dashboard-page">
       <h1>Upload History</h1>
-      <div className="history-table-container " style={{ background: '#0f172a', padding: '24px', borderRadius: '16px', border: '1px solid #1e293b'}}>
+      <div className="history-table-container" style={{ background: '#0f172a', padding: '24px', borderRadius: '16px', border: '1px solid #1e293b'}}>
         <table style={{ width: '100%', textAlign: 'left', borderCollapse: 'collapse' }}>
           <thead>
             <tr style={{ borderBottom: '1px solid #334155' }}>

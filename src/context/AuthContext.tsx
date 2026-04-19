@@ -27,7 +27,7 @@ type AuthContextValue = {
   logout: () => Promise<void>
 }
 
-const AuthContext = createContext<AuthContextValue | undefined>(undefined)
+export const AuthContext = createContext<AuthContextValue | undefined>(undefined)
 
 function toAuthErrorMessage(error: unknown): string {
   if (!(error instanceof FirebaseError)) {

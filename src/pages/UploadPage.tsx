@@ -1,4 +1,5 @@
-import { useState, type FormEvent, useEffect } from 'react'
+import { useState, type FormEvent, useEffect, useContext } from 'react'
+import { AuthContext } from '../context/AuthContext'
 
 export default function UploadPage() {
   const [file, setFile] = useState<File | null>(null)
@@ -6,6 +7,8 @@ export default function UploadPage() {
   const [result, setResult] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
   const [models, setModels] = useState<{value: string, label: string}[]>([])
+  const [errorMsg, setErrorMsg] = useState<string | null>(null)
+  const authContext = useContext(AuthContext)
 
   useEffect(() => {
     // Fetch models here too, so the dropdown matches available backend models
@@ -21,16 +24,32 @@ export default function UploadPage() {
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault()
-    if (!file) return
+    setErrorMsg(null)
+    setResult(null)
+
+    if (!file) {
+      setErrorMsg('Please select an image file.')
+      return
+    }
+
+    if (!file.type.startsWith('image/')) {
+      setErrorMsg('Invalid file type. Only images are allowed.')
+      return
+    }
+
+    if (!authContext?.user?.uid) {
+      setErrorMsg('You must be logged in to upload.')
+      return
+    }
 
     setLoading(true)
-    setResult(null)
 
     // Using fetch API to hit FastAPI backend
     try {
       const formData = new FormData()
       formData.append('file', file)
       formData.append('model', model)
+      formData.append('user_id', authContext.user.uid)
 
       const response = await fetch('http://localhost:8000/api/inference', {
         method: 'POST',
@@ -42,11 +61,10 @@ export default function UploadPage() {
       }
 
       const data = await response.json()
-      // Expected data schema: { id: string, result: string, confidence: number, model: string, timestamp: string }
-      setResult(`Result for ${data.model}: ${data.result} (Confidence: ${data.confidence}%)`)
+      setResult(`Result for ${data.model}: ${data.result}`)
     } catch (error) {
       console.error('Error during inference:', error)
-      setResult('Failed to run inference. Please try again.')
+      setErrorMsg('Failed to run inference. Please try again.')
     } finally {
       setLoading(false)
     }
@@ -60,7 +78,7 @@ export default function UploadPage() {
         <form onSubmit={handleSubmit} style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
           
           <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-            <label style={{ fontWeight: '600', color: '#cbd5e1' }}>Select Image</label>
+            <label style={{ fontWeight: '600', color: '#cbd5e1' }}>Select Image (Heatmap)</label>
             <input 
               type="file" 
               accept="image/*" 
@@ -88,6 +106,8 @@ export default function UploadPage() {
               ))}
             </select>
           </div>
+
+          {errorMsg && <div style={{ color: '#ef4444' }}>{errorMsg}</div>}
 
           <button 
             type="submit" 

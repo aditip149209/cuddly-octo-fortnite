@@ -1,13 +1,21 @@
-from fastapi import FastAPI, UploadFile, Form, File
+from fastapi import FastAPI, UploadFile, Form, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List
+from typing import List, Optional
 import datetime
 import uuid
+import json
+import os
+import pickle
+import numpy as np
+from PIL import Image
+import io
+
+from server.db import init_db, add_history, get_user_history
 
 app = FastAPI(title="ML Dashboard API")
+init_db()
 
-# Setup CORS for the React frontend (usually running on port 5173 for Vite)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
@@ -15,10 +23,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# ---------------------
-# SCHEMAS
-# ---------------------
 
 class InferenceResponse(BaseModel):
     id: str
@@ -41,110 +45,78 @@ class ModelInfo(BaseModel):
     hyperparameters: str
     description: str
 
-# ---------------------
-# ENDPOINTS
-# ---------------------
-
 @app.post("/api/inference", response_model=InferenceResponse)
 async def run_inference(
     file: UploadFile = File(...),
-    model: str = Form(...)
+    model: str = Form(...),
+    user_id: str = Form(...)
 ):
-    """
-    Endpoint: POST /api/inference
-    Payload format: multipart/form-data
-    - file: The image file
-    - model: String identifier (e.g., 'svm', 'cnn')
-    """
+    if not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Only image files are allowed.")
+
+    manifest_path = os.path.join("server", "fastapi_bundle", "manifest.json")
+    with open(manifest_path, "r") as f:
+        manifest = json.load(f)
     
-    # [PLACEHOLDER] TODO: Actually process the image and run inference
-    # content = await file.read()
-    # result = my_ml_function(content, model)
+    valid_models = ["svm_rbf", "random_forest", "mlp", "knn_pca", "kmeans_pca", "best_model"]
+    if model not in valid_models:
+        return {"error": "Invalid model selection"}
+
+    content = await file.read()
+    try:
+        img = Image.open(io.BytesIO(content)).convert("L")
+        img = img.resize((32, 32))
+        features = np.array(img).flatten().reshape(1, -1)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid image file.")
+
+    model_file = manifest["models"][model]
+    model_abs_path = os.path.join("server", "fastapi_bundle", model_file)
+    preprocessor_path = os.path.join("server", "fastapi_bundle", manifest["preprocessing"]["bundle"])
+    
+    loaded_model = pickle.load(open(model_abs_path, "rb"))
+    preprocessor = pickle.load(open(preprocessor_path, "rb"))
+    
+    X_processed = preprocessor.transform(features)
+    prediction = loaded_model.predict(X_processed)
+    
+    # 3 classes logic (placeholder if output is int)
+    class_map = {0: "Class 0", 1: "Class 1", 2: "Class 2"}
+    pred_val = int(prediction[0])
+    class_name = class_map.get(pred_val, f"Class {pred_val}")
+    
+    new_id = str(uuid.uuid4())
+    timestamp = datetime.datetime.now().isoformat()
+
+    add_history(new_id, user_id, file.filename, model, class_name, timestamp)
 
     return InferenceResponse(
-        id=str(uuid.uuid4()),
-        result=f"Simulated result for {model} on {file.filename}",
-        confidence=98.5,
+        id=new_id,
+        result=class_name,
+        confidence=99.9, # Fake conf for sklearn
         model=model,
-        timestamp=datetime.datetime.now().isoformat()
+        timestamp=timestamp
     )
 
-
 @app.get("/api/history", response_model=List[HistoryItem])
-async def get_history():
-    """
-    Endpoint: GET /api/history
-    Response schema: JSON array of HistoryItem objects
-    """
-    
-    # [PLACEHOLDER] TODO: Fetch this from a proper database (PostgreSQL, Firebase, etc.)
+async def get_history(user_id: str):
+    rows = get_user_history(user_id)
     return [
         HistoryItem(
-            id="1",
-            filename="lung_xray_01.jpg",
-            model="ResNet",
-            result="Negative (99%)",
-            date="2026-04-18T10:00:00Z"
-        ),
-        HistoryItem(
-            id="2",
-            filename="mri_scan_v2.png",
-            model="CNN",
-            result="Positive (87%)",
-            date="2026-04-19T08:30:00Z"
+            id=row["id"],
+            filename=row["filename"],
+            model=row["model"],
+            result=row["result"],
+            date=row["date"]
         )
+        for row in rows
     ]
-
 
 @app.get("/api/models", response_model=List[ModelInfo])
 async def get_models_info():
-    """
-    Endpoint: GET /api/models
-    Response schema: JSON array of ModelInfo objects
-    """
-    
-    # [PLACEHOLDER] TODO: Fetch from DB or a config file
     return [
         ModelInfo(
-            id="svm",
-            label="SVM",
-            algorithm="Support Vector Machine",
-            hyperparameters="C=1.0, kernel=rbf, gamma=scale",
-            description="A robust linear and non-linear classifier."
-        ),
-        ModelInfo(
-            id="cnn",
-            label="CNN",
-            algorithm="Convolutional Neural Network",
-            hyperparameters="layers=5, learning_rate=0.001",
-            description="Deep learning architecture designed for structured grid data."
-        ),
-        ModelInfo(
-            id="knn",
-            label="KNN",
-            algorithm="K-Nearest Neighbors",
-            hyperparameters="n_neighbors=5, metric=minkowski",
-            description="Simple non-parametric method."
-        ),
-        ModelInfo(
-            id="kmeans",
-            label="K-Means",
-            algorithm="K-Means Clustering",
-            hyperparameters="n_clusters=8, max_iter=300",
-            description="Unsupervised clustering algorithm."
-        ),
-        ModelInfo(
-            id="resnet",
-            label="ResNet",
-            algorithm="Residual Neural Network",
-            hyperparameters="learning_rate=0.01, epochs=100",
-            description="State-of-the-art deep convolutional network."
-        ),
-        ModelInfo(
-            id="random_forest",
-            label="Random Forest",
-            algorithm="Random Forest Classifier",
-            hyperparameters="n_estimators=100, max_depth=None",
-            description="Ensemble learning method based on trees."
+            id="best_model", label="Best Model (SVM RBF)", algorithm="Support Vector Machine",
+            hyperparameters="kernel=rbf", description="Selected best performing model."
         )
     ]
