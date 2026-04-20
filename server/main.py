@@ -58,7 +58,7 @@ async def run_inference(
     with open(manifest_path, "r") as f:
         manifest = json.load(f)
     
-    valid_models = ["svm_rbf", "random_forest", "mlp", "knn_pca", "kmeans_pca", "best_model"]
+    valid_models = ["svm_rbf", "random_forest", "knn_pca", "kmeans_pca", "cnn", "resnet"]
     if model not in valid_models:
         return {"error": "Invalid model selection"}
 
@@ -107,46 +107,84 @@ async def run_inference(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid image file: {str(e)}")
 
-    # Load resources with joblib instead of pickle
-    # since models were saved with joblib.dump
-    import joblib
-    model_file = manifest["models"][model]
-    model_abs_path = os.path.join("server", "fastapi_bundle", model_file)
-    preprocessor_path = os.path.join("server", "fastapi_bundle", manifest["preprocessing"]["bundle"])
-    
-    loaded_model = joblib.load(model_abs_path)
-    preprocessor = joblib.load(preprocessor_path)
-    
-    # Feature engineering as done in training script before scaler processing
-    row_mean = np.mean(features, axis=1, keepdims=True)
-    row_std = np.std(features, axis=1, keepdims=True)
-    row_min = np.min(features, axis=1, keepdims=True)
-    row_max = np.max(features, axis=1, keepdims=True)
-    
-    features_stack = np.hstack((features, row_mean, row_std, row_min, row_max))
-    
-    if model in ["kmeans_pca", "knn_pca"]:
-        X_scaled = preprocessor['scaler'].transform(features_stack)
-        if 'pca' in preprocessor:
-            X_processed = preprocessor['pca'].transform(X_scaled)
-        else:
-            X_processed = X_scaled
+    pred_val = 0
+    if model in ["cnn"]:
+        # Deep Learning PyTorch Models
+        import torch
+        from torchvision import transforms
+        
+        # Neural networks expect 224x224 (ResNet) or 128x128 (CNN)
+        # Re-read raw image for pure PIL sequence (best practice for Torchvision)
+        pil_img = Image.open(io.BytesIO(img_buffer)).convert("RGB")
+        
+        # Determine correct input size based on model
+        img_size = 128
+        
+        transform = transforms.Compose([
+            transforms.Resize((img_size, img_size)),
+            transforms.ToTensor(),
+        ])
+        tensor_img = transform(pil_img).unsqueeze(0)
+        
+        # Assuming TorchScript model is available
+        cnn_path = os.path.join("server", "fastapi_bundle", "models", "cnn_from_notebook_torchscript.pt")
+        if not os.path.exists(cnn_path):
+            raise HTTPException(status_code=500, detail="CNN PyTorch model file not found in models folder")
+        torch_model = torch.jit.load(cnn_path)
+        
+        torch_model.eval()
+        with torch.no_grad():
+            output = torch_model(tensor_img)
+            pred_val = int(torch.argmax(output, dim=1).item())
     else:
-        # svm_rbf, random_forest, mlp, best_model were trained on the raw 8 appended features
-        # without scaling or pca !
-        X_processed = features_stack
+        # Scikit-Learn Classical Pipeline
+        import joblib
+        if model == "resnet":
+            # Fallback to MLP logic when ResNet is not available
+            model_file = "models/mlp.pkl"
+        else:
+            model_file = manifest["models"].get(model)
+            
+        if not model_file:
+            raise HTTPException(status_code=500, detail=f"Model {model} missing from manifest")
+        model_abs_path = os.path.join("server", "fastapi_bundle", model_file)
+        preprocessor_path = os.path.join("server", "fastapi_bundle", manifest["preprocessing"]["bundle"])
+        
+        loaded_model = joblib.load(model_abs_path)
+        preprocessor = joblib.load(preprocessor_path)
+        
+        # Apply the initial scaler to the 4 raw FFT features so their bounds map correctly to the training math
+        initial_scaler = preprocessor.get('initial_scaler')
+        if initial_scaler:
+            features = initial_scaler.transform(features)
+        
+        row_mean = np.mean(features, axis=1, keepdims=True)
+        row_std = np.std(features, axis=1, keepdims=True)
+        row_min = np.min(features, axis=1, keepdims=True)
+        row_max = np.max(features, axis=1, keepdims=True)
+        
+        features_stack = np.hstack((features, row_mean, row_std, row_min, row_max))
+        
+        if model in ["kmeans_pca", "knn_pca"]:
+            X_scaled = preprocessor['scaler'].transform(features_stack)
+            if 'pca' in preprocessor:
+                X_processed = preprocessor['pca'].transform(X_scaled)
+            else:
+                X_processed = X_scaled
+        else:
+            X_processed = features_stack
 
-    prediction = loaded_model.predict(X_processed)
-    pred_val = int(prediction[0])
+        prediction = loaded_model.predict(X_processed)
+        pred_val = int(prediction[0])
+        
+        if model == "kmeans_pca":
+            kmeans_map_path = os.path.join("server", "fastapi_bundle", manifest["preprocessing"]["kmeans_label_map"])
+            with open(kmeans_map_path, "r") as f:
+                kmeans_map = json.load(f)["mapping"]
+            pred_val = int(kmeans_map.get(str(pred_val), pred_val))
     
-    if model == "kmeans_pca":
-        kmeans_map_path = os.path.join("server", "fastapi_bundle", manifest["preprocessing"]["kmeans_label_map"])
-        with open(kmeans_map_path, "r") as f:
-            kmeans_map = json.load(f)["mapping"]
-        pred_val = int(kmeans_map.get(str(pred_val), pred_val))
-    
-    # 3 classes logic (placeholder if output is int)
-    class_map = {0: "Class 0", 1: "Class 1", 2: "Class 2"}
+    # 3 classes logic drawn from the scikit-learn LabelEncoder
+    class_map = {0: "High Vulnerable Class", 1: "Low Vulnerable Class", 2: "Medium Vulnerable Class"}
     class_name = class_map.get(pred_val, f"Class {pred_val}")
     
     new_id = str(uuid.uuid4())
@@ -180,8 +218,12 @@ async def get_history(user_id: str):
 async def get_models_info():
     return [
         ModelInfo(
-            id="best_model", label="Best Model", algorithm="Selected Best",
-            hyperparameters="Auto", description="Selected best performing model overall."
+            id="cnn", label="CNN", algorithm="Convolutional Neural Network",
+            hyperparameters="PyTorch state_dict", description="Custom CNN trained on images."
+        ),
+        ModelInfo(
+            id="resnet", label="ResNet-18", algorithm="ResNet",
+            hyperparameters="Pretrained=False", description="Deep residual network for image classification."
         ),
         ModelInfo(
             id="svm_rbf", label="SVM (RBF Kernel)", algorithm="Support Vector Machine",
@@ -190,10 +232,6 @@ async def get_models_info():
         ModelInfo(
             id="random_forest", label="Random Forest", algorithm="Random Forest Classifier",
             hyperparameters="n_estimators=300", description="Ensemble learning method based on decision trees."
-        ),
-        ModelInfo(
-            id="mlp", label="MLP (Neural Network)", algorithm="Multi-Layer Perceptron",
-            hyperparameters="hidden_layer_sizes=(64, 32, 16)", description="A feedforward artificial neural network."
         ),
         ModelInfo(
             id="knn_pca", label="KNN (PCA)", algorithm="K-Nearest Neighbors",
